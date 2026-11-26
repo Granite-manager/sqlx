@@ -29,6 +29,7 @@ impl MySqlConnection {
                 transaction_depth: 0,
                 status_flags: Default::default(),
                 cache_statement: StatementCache::new(options.statement_cache_capacity),
+                result_metadata: Default::default(),
                 log_settings: options.log_settings.clone(),
             }),
         })

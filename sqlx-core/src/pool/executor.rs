@@ -48,6 +48,27 @@ where
         Box::pin(async move { pool.acquire().await?.fetch_optional(query).await })
     }
 
+    // granite patch: `fetch_all` and `execute` run on the acquired connection
+    // itself. The defaults go through `fetch_many` above, which relays every
+    // row of the connection's stream through a second stream.
+    fn fetch_all<'e, 'q: 'e, E>(self, query: E) -> BoxFuture<'e, Result<Vec<DB::Row>, Error>>
+    where
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        let pool = self.clone();
+
+        Box::pin(async move { pool.acquire().await?.fetch_all(query).await })
+    }
+
+    fn execute<'e, 'q: 'e, E>(self, query: E) -> BoxFuture<'e, Result<DB::QueryResult, Error>>
+    where
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        let pool = self.clone();
+
+        Box::pin(async move { pool.acquire().await?.execute(query).await })
+    }
+
     fn prepare_with<'e>(
         self,
         sql: SqlStr,

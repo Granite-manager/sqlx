@@ -135,11 +135,9 @@ where
         (O,): 'e,
         A: 'e,
     {
-        self.inner
-            .fetch(executor)
-            .map_ok(|it| it.0)
-            .try_collect()
-            .await
+        // granite patch: see `QueryAs::fetch_all`.
+        let rows = self.inner.fetch_all(executor).await?;
+        Ok(rows.into_iter().map(|it| it.0).collect())
     }
 
     /// Execute the query, returning the first row or [`Error::RowNotFound`] otherwise.

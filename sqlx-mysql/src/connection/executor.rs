@@ -90,6 +90,7 @@ impl MySqlConnection {
             .cache_statement
             .insert(sql, (id, metadata.clone()))
         {
+            self.inner.result_metadata.remove(&id);
             self.inner
                 .stream
                 .send_packet(StmtClose { statement: id })
@@ -120,11 +121,15 @@ impl MySqlConnection {
             // to re-use this memory freely between result sets
             let mut columns = Arc::new(Vec::new());
 
+            // granite patch: the cached statement run, if one is
+            let mut cached_statement = None;
+
             let format = if let Some(arguments) = arguments {
                 if persistent && self.inner.cache_statement.is_enabled() {
                     let (id, metadata) = self
                         .get_or_prepare_statement(sql)
                         .await?;
+                    cached_statement = Some(id);
 
                     if arguments.types.len() != metadata.parameters {
                         return Err(
@@ -218,7 +223,23 @@ impl MySqlConnection {
 
                 // Always reload column names, even for prepared statements (the schema
                 // may change between PREPARE and EXECUTE).
-                let column_names = Arc::new(recv_result_metadata(&mut self.inner.stream, num_columns, Arc::make_mut(&mut columns)).await?);
+                // granite patch: a cached statement whose columns arrive as they did
+                // last time shares what was decoded then (`recv_result_metadata_reusing`).
+                let column_names = match cached_statement {
+                    Some(id) => {
+                        let inner = &mut *self.inner;
+                        let (known_columns, column_names) = recv_result_metadata_reusing(
+                            &mut inner.stream,
+                            &mut inner.result_metadata,
+                            id,
+                            num_columns,
+                        )
+                        .await?;
+                        columns = known_columns;
+                        column_names
+                    }
+                    None => Arc::new(recv_result_metadata(&mut self.inner.stream, num_columns, Arc::make_mut(&mut columns)).await?),
+                };
 
                 // finally, there will be none or many result-rows
                 loop {
@@ -270,8 +291,270 @@ impl MySqlConnection {
     }
 }
 
+/// granite patch: the columns a cached statement answered with, kept with
+/// the bytes of their definitions as the server sent them.
+///
+/// The server sends every column's definition again with each execution and
+/// upstream decodes them again (a name and an origin allocated per column,
+/// a map of names per result). The definitions of a statement run again are
+/// almost always the same bytes: then the decoded columns are shared. Any
+/// difference (the schema changed) decodes them anew, as upstream always does.
+#[derive(Clone)]
+pub(crate) struct ResultMetadata {
+    definitions: Arc<[Box<[u8]>]>,
+    columns: Arc<Vec<MySqlColumn>>,
+    column_names: Arc<HashMap<UStr, usize>>,
+}
+
+/// granite patch: [`recv_result_metadata`] for the cached statement `id`,
+/// sharing its columns when they arrive as they did last time
+/// ([`ResultMetadata`]).
+async fn recv_result_metadata_reusing(
+    stream: &mut MySqlStream,
+    known: &mut HashMap<u32, ResultMetadata>,
+    id: u32,
+    num_columns: usize,
+) -> Result<(Arc<Vec<MySqlColumn>>, Arc<HashMap<UStr, usize>>), Error> {
+    // the limit `recv_result_metadata` enforces
+    if num_columns > 4096 {
+        return Err(err_protocol!(
+            "result-set metadata claims {num_columns} columns but the maximum supported is 4096"
+        ));
+    }
+
+    let last = known
+        .get(&id)
+        .filter(|last| last.definitions.len() == num_columns)
+        .cloned();
+    let mut same = last.is_some();
+    // the definitions received, kept only once one differs
+    let mut received: Vec<bytes::Bytes> = Vec::new();
+
+    for ordinal in 0..num_columns {
+        let packet = stream.recv_packet().await?.0;
+
+        if same {
+            if let Some(last) = &last {
+                if last.definitions[ordinal][..] == packet[..] {
+                    continue;
+                }
+                received.reserve(num_columns);
+                received.extend(
+                    last.definitions[..ordinal]
+                        .iter()
+                        .map(|definition| bytes::Bytes::copy_from_slice(definition)),
+                );
+            }
+            same = false;
+        }
+
+        received.push(packet);
+    }
+
+    stream.maybe_recv_eof().await?;
+
+    if let (true, Some(last)) = (same, last) {
+        return Ok((last.columns, last.column_names));
+    }
+
+    let mut columns = Vec::with_capacity(num_columns);
+    let mut column_names = HashMap::with_capacity(num_columns);
+
+    for (ordinal, packet) in received.iter().enumerate() {
+        let def = <ColumnDefinition as sqlx_core::io::ProtocolDecode<'_, _>>::decode_with(
+            packet.clone(),
+            stream.capabilities,
+        )?;
+        let column = recv_next_result_column(&def, ordinal)?;
+
+        column_names.insert(column.name.clone(), ordinal);
+        columns.push(column);
+    }
+
+    let metadata = ResultMetadata {
+        definitions: received.iter().map(|packet| packet[..].into()).collect(),
+        columns: Arc::new(columns),
+        column_names: Arc::new(column_names),
+    };
+    let found = (
+        Arc::clone(&metadata.columns),
+        Arc::clone(&metadata.column_names),
+    );
+    known.insert(id, metadata);
+
+    Ok(found)
+}
+
+impl MySqlConnection {
+    /// granite patch: [`Self::run`] for a caller that wants every row at
+    /// once: the same commands and packets in the same order, the rows
+    /// pushed onto a `Vec` here instead of handed up one at a time through
+    /// two streams (`run`'s and `fetch_many`'s) and the caller's collect.
+    async fn run_all(
+        &mut self,
+        sql: SqlStr,
+        arguments: Option<MySqlArguments>,
+        persistent: bool,
+    ) -> Result<Vec<MySqlRow>, Error> {
+        let mut logger = QueryLogger::new(sql, self.inner.log_settings.clone());
+
+        self.inner.stream.wait_until_ready().await?;
+        self.inner.stream.waiting.push_back(Waiting::Result);
+
+        let mut columns = Arc::new(Vec::new());
+        let mut cached_statement = None;
+        let mut rows = Vec::new();
+
+        let format = {
+            let sql = logger.sql().as_str();
+
+            if let Some(arguments) = arguments {
+                let cached = persistent && self.inner.cache_statement.is_enabled();
+                let (id, metadata) = if cached {
+                    self.get_or_prepare_statement(sql).await?
+                } else {
+                    self.prepare_statement(sql).await?
+                };
+
+                if arguments.types.len() != metadata.parameters {
+                    return Err(err_protocol!(
+                        "prepared statement expected {} parameters but {} parameters were provided",
+                        metadata.parameters,
+                        arguments.types.len()
+                    ));
+                }
+
+                self.inner
+                    .stream
+                    .send_packet(StatementExecute {
+                        statement: id,
+                        arguments: &arguments,
+                    })
+                    .await?;
+
+                if cached {
+                    cached_statement = Some(id);
+                } else {
+                    self.inner
+                        .stream
+                        .send_packet(StmtClose { statement: id })
+                        .await?;
+                }
+
+                MySqlValueFormat::Binary
+            } else {
+                self.inner.stream.send_packet(Query(sql)).await?;
+
+                MySqlValueFormat::Text
+            }
+        };
+
+        loop {
+            let mut packet = self.inner.stream.recv_packet().await?;
+
+            if packet[0] == 0x00 || packet[0] == 0xff {
+                let ok = packet.ok()?;
+
+                self.inner.status_flags = ok.status;
+                logger.increase_rows_affected(ok.affected_rows);
+
+                if ok.status.contains(Status::SERVER_MORE_RESULTS_EXISTS) {
+                    continue;
+                }
+
+                self.inner.stream.waiting.pop_front();
+                return Ok(rows);
+            }
+
+            *self.inner.stream.waiting.front_mut().unwrap() = Waiting::Row;
+
+            let num_columns = packet.get_uint_lenenc()?;
+            let num_columns = usize::try_from(num_columns)
+                .map_err(|_| err_protocol!("column count overflows usize: {num_columns}"))?;
+
+            let column_names = match cached_statement {
+                Some(id) => {
+                    let inner = &mut *self.inner;
+                    let (known_columns, column_names) = recv_result_metadata_reusing(
+                        &mut inner.stream,
+                        &mut inner.result_metadata,
+                        id,
+                        num_columns,
+                    )
+                    .await?;
+                    columns = known_columns;
+                    column_names
+                }
+                None => Arc::new(
+                    recv_result_metadata(
+                        &mut self.inner.stream,
+                        num_columns,
+                        Arc::make_mut(&mut columns),
+                    )
+                    .await?,
+                ),
+            };
+
+            loop {
+                let packet = self.inner.stream.recv_packet().await?;
+
+                if packet[0] == 0xfe {
+                    let status = if packet.len() < 9 {
+                        packet.eof(self.inner.stream.capabilities)?.status
+                    } else {
+                        packet.ok()?.status
+                    };
+
+                    self.inner.status_flags = status;
+
+                    if status.contains(Status::SERVER_MORE_RESULTS_EXISTS) {
+                        *self.inner.stream.waiting.front_mut().unwrap() = Waiting::Result;
+                        break;
+                    }
+
+                    self.inner.stream.waiting.pop_front();
+                    return Ok(rows);
+                }
+
+                let row = match format {
+                    MySqlValueFormat::Binary => packet.decode_with::<BinaryRow, _>(&columns)?.0,
+                    MySqlValueFormat::Text => packet.decode_with::<TextRow, _>(&columns)?.0,
+                };
+
+                rows.push(MySqlRow {
+                    row,
+                    format,
+                    columns: Arc::clone(&columns),
+                    column_names: Arc::clone(&column_names),
+                });
+
+                logger.increment_rows_returned();
+            }
+        }
+    }
+}
+
 impl<'c> Executor<'c> for &'c mut MySqlConnection {
     type Database = MySql;
+
+    // granite patch: every row at once, without the row streams (`run_all`).
+    fn fetch_all<'e, 'q, E>(self, mut query: E) -> BoxFuture<'e, Result<Vec<MySqlRow>, Error>>
+    where
+        'c: 'e,
+        E: Execute<'q, Self::Database>,
+        'q: 'e,
+        E: 'q,
+    {
+        let arguments = query.take_arguments().map_err(Error::Encode);
+        let persistent = query.persistent();
+
+        Box::pin(async move {
+            let sql = query.sql();
+            let arguments = arguments?;
+
+            self.run_all(sql, arguments, persistent).await
+        })
+    }
 
     fn fetch_many<'e, 'q, E>(
         self,

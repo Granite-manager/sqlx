@@ -48,6 +48,10 @@ pub(crate) struct MySqlConnectionInner {
     // cache by query string to the statement id and metadata
     cache_statement: StatementCache<(u32, MySqlStatementMetadata)>,
 
+    // granite patch: the result columns each cached statement last answered
+    // with, by statement id (see `executor::ResultMetadata`)
+    result_metadata: crate::HashMap<u32, executor::ResultMetadata>,
+
     log_settings: LogSettings,
 }
 
@@ -100,6 +104,7 @@ impl Connection for MySqlConnection {
     }
 
     async fn clear_cached_statements(&mut self) -> Result<(), Error> {
+        self.inner.result_metadata.clear();
         while let Some((statement_id, _)) = self.inner.cache_statement.remove_lru() {
             self.inner
                 .stream

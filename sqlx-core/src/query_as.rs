@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use either::Either;
 use futures_core::stream::BoxStream;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::StreamExt;
 
 use crate::arguments::IntoArguments;
 use crate::database::{Database, HasStatementCache};
@@ -141,7 +141,11 @@ where
         O: 'e,
         A: 'e,
     {
-        self.fetch(executor).try_collect().await
+        // granite patch: the executor's own `fetch_all`, then the rows are
+        // mapped in a loop (upstream maps and collects a stream, two more
+        // polls per row).
+        let rows = executor.fetch_all(self.inner).await?;
+        rows.iter().map(|row| O::from_row(row)).collect()
     }
 
     /// Execute the query, returning the first row or [`Error::RowNotFound`] otherwise.
