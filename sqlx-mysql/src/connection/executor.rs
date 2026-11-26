@@ -112,6 +112,9 @@ impl MySqlConnection {
 
         self.inner.stream.wait_until_ready().await?;
         self.inner.stream.waiting.push_back(Waiting::Result);
+        // granite patch: until the query is sent, `waiting` expects a
+        // response nobody asked for (see `MySqlStream::in_command`).
+        self.inner.stream.in_command = true;
 
         Ok(try_stream! {
         let sql = logger.sql().as_str();
@@ -148,6 +151,7 @@ impl MySqlConnection {
                             arguments: &arguments,
                         })
                         .await?;
+                    self.inner.stream.in_command = false;
 
                     MySqlValueFormat::Binary
                 } else {
@@ -172,6 +176,7 @@ impl MySqlConnection {
                             arguments: &arguments,
                         })
                         .await?;
+                    self.inner.stream.in_command = false;
 
                     self.inner.stream.send_packet(StmtClose { statement: id }).await?;
 
@@ -180,6 +185,7 @@ impl MySqlConnection {
             } else {
                 // https://dev.mysql.com/doc/internals/en/com-query.html
                 self.inner.stream.send_packet(Query(sql)).await?;
+                self.inner.stream.in_command = false;
 
                 MySqlValueFormat::Text
             };
@@ -400,6 +406,9 @@ impl MySqlConnection {
 
         self.inner.stream.wait_until_ready().await?;
         self.inner.stream.waiting.push_back(Waiting::Result);
+        // granite patch: until the query is sent, `waiting` expects a
+        // response nobody asked for (see `MySqlStream::in_command`).
+        self.inner.stream.in_command = true;
 
         let mut columns = Arc::new(Vec::new());
         let mut cached_statement = None;
@@ -431,6 +440,7 @@ impl MySqlConnection {
                         arguments: &arguments,
                     })
                     .await?;
+                self.inner.stream.in_command = false;
 
                 if cached {
                     cached_statement = Some(id);
@@ -444,6 +454,7 @@ impl MySqlConnection {
                 MySqlValueFormat::Binary
             } else {
                 self.inner.stream.send_packet(Query(sql)).await?;
+                self.inner.stream.in_command = false;
 
                 MySqlValueFormat::Text
             }
@@ -612,6 +623,8 @@ impl<'c> Executor<'c> for &'c mut MySqlConnection {
     {
         Box::pin(async move {
             self.inner.stream.wait_until_ready().await?;
+            // granite patch: see `MySqlStream::in_command`
+            self.inner.stream.in_command = true;
 
             let metadata = if self.inner.cache_statement.is_enabled() {
                 self.get_or_prepare_statement(sql.as_str()).await?.1
@@ -625,6 +638,7 @@ impl<'c> Executor<'c> for &'c mut MySqlConnection {
 
                 metadata
             };
+            self.inner.stream.in_command = false;
 
             Ok(MySqlStatement {
                 sql,
@@ -645,6 +659,8 @@ impl<'c> Executor<'c> for &'c mut MySqlConnection {
     {
         Box::pin(async move {
             self.inner.stream.wait_until_ready().await?;
+            // granite patch: see `MySqlStream::in_command`
+            self.inner.stream.in_command = true;
 
             let (id, metadata) = self.prepare_statement(sql.as_str()).await?;
 
@@ -652,6 +668,7 @@ impl<'c> Executor<'c> for &'c mut MySqlConnection {
                 .stream
                 .send_packet(StmtClose { statement: id })
                 .await?;
+            self.inner.stream.in_command = false;
 
             let columns = (*metadata.columns).clone();
 
