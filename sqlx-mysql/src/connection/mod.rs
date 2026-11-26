@@ -88,8 +88,11 @@ impl Connection for MySqlConnection {
 
     async fn ping(&mut self) -> Result<(), Error> {
         self.inner.stream.wait_until_ready().await?;
+        // granite patch: see `MySqlStream::in_command`
+        self.inner.stream.in_command = true;
         self.inner.stream.send_packet(Ping).await?;
         self.inner.stream.recv_ok().await?;
+        self.inner.stream.in_command = false;
 
         Ok(())
     }
@@ -120,6 +123,14 @@ impl Connection for MySqlConnection {
     #[doc(hidden)]
     fn should_flush(&self) -> bool {
         !self.inner.stream.write_buffer().is_empty()
+    }
+
+    // granite patch: `flush` (`wait_until_ready`) sends a queued `ROLLBACK`,
+    // reads what the last command left unread, and fails on a connection
+    // whose command was cancelled mid-way.
+    #[doc(hidden)]
+    fn release_test_is_flush(&self) -> bool {
+        true
     }
 
     fn begin(

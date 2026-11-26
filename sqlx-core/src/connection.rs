@@ -165,6 +165,16 @@ pub trait Connection: Send {
     #[doc(hidden)]
     fn should_flush(&self) -> bool;
 
+    /// granite patch: `true` if [`flush`][Self::flush] is a full test of a
+    /// connection handed back to its pool: it finishes whatever the last
+    /// command left (unread results, a queued `ROLLBACK`) and fails if the
+    /// connection cannot be trusted (a command cancelled mid-way). The pool
+    /// then flushes instead of pinging. `false` (the default) keeps the ping.
+    #[doc(hidden)]
+    fn release_test_is_flush(&self) -> bool {
+        false
+    }
+
     /// Establish a new database connection.
     ///
     /// A value of [`Options`][Self::Options] is parsed from the provided connection string. This parsing

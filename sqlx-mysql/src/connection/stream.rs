@@ -26,6 +26,15 @@ pub struct MySqlStream<S = Box<dyn Socket>> {
     pub(crate) sequence_id: u8,
     pub(crate) waiting: VecDeque<Waiting>,
     pub(crate) is_tls: bool,
+    // granite patch: a command was sent (or is about to be) whose response
+    // `waiting` does not describe: a prepare, a ping, or a query whose
+    // `Waiting::Result` is pushed before the query itself is sent. Cleared
+    // when that response is read to the end, or once the query is sent.
+    // Still set later means the command was cancelled mid-way, and the
+    // connection cannot be trusted (see `wait_until_ready`).
+    pub(crate) in_command: bool,
+    // granite patch: a packet's header was read but not its payload.
+    pub(crate) mid_packet: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -66,10 +75,23 @@ impl<S: Socket> MySqlStream<S> {
             sequence_id: 0,
             socket: BufferedSocket::new(socket),
             is_tls: false,
+            in_command: false,
+            mid_packet: false,
         }
     }
 
     pub(crate) async fn wait_until_ready(&mut self) -> Result<(), Error> {
+        // granite patch: a command cancelled before its response was read
+        // left bytes this connection cannot tell from the next command's
+        // response (upstream would read them as that response, or wait for
+        // a response that never comes). Refuse: the pool closes the
+        // connection and opens another.
+        if self.in_command || self.mid_packet {
+            return Err(err_protocol!(
+                "connection is out of sync: a command was cancelled before its response was read"
+            ));
+        }
+
         if !self.socket.write_buffer().is_empty() {
             self.socket.flush().await?;
         }
@@ -131,6 +153,7 @@ impl<S: Socket> MySqlStream<S> {
         // https://mariadb.com/kb/en/library/0-packet/#standard-packet
 
         let mut header: Bytes = self.socket.read(4).await?;
+        self.mid_packet = true;
 
         // cannot overflow
         #[allow(clippy::cast_possible_truncation)]
@@ -140,6 +163,7 @@ impl<S: Socket> MySqlStream<S> {
         self.sequence_id = sequence_id.wrapping_add(1);
 
         let payload: Bytes = self.socket.read(packet_size).await?;
+        self.mid_packet = false;
 
         // TODO: packet compression
 
@@ -181,6 +205,9 @@ impl<S: Socket> MySqlStream<S> {
             .eq(&0xff)
         {
             self.waiting.pop_front();
+            // granite patch: an error packet is the whole response to the
+            // command being read, whichever it was.
+            self.in_command = false;
 
             // instead of letting this packet be looked at everywhere, we check here
             // and emit a proper Error
@@ -231,6 +258,8 @@ impl<S: Socket> MySqlStream<S> {
             sequence_id: self.sequence_id,
             waiting: self.waiting,
             is_tls: self.is_tls,
+            in_command: self.in_command,
+            mid_packet: self.mid_packet,
         }
     }
 }

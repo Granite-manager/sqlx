@@ -1,7 +1,9 @@
 use std::fmt::{self, Debug, Formatter};
 use std::future::{self, Future};
 use std::ops::{Deref, DerefMut};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Waker};
 use std::time::{Duration, Instant};
 
 use crate::sync::AsyncSemaphoreReleaser;
@@ -205,7 +207,23 @@ impl<DB: Database> Drop for PoolConnection<DB> {
 
         // We still need to spawn a task to maintain `min_connections`.
         if self.live.is_some() || self.pool.options.min_connections > 0 {
-            crate::rt::spawn(self.return_to_pool());
+            // granite patch: the return is polled once here, and spawned only
+            // if it has to wait. A connection whose last command was read to
+            // the end (the usual case, see `Connection::release_test_is_flush`)
+            // has nothing to wait for, so it is back in the pool before
+            // `drop` returns, without a task, a ping, or a round trip. While
+            // the thread is panicking the return is spawned as before, so a
+            // panic in `after_release` cannot abort the process.
+            let mut returning: Pin<Box<dyn Future<Output = ()> + Send>> =
+                Box::pin(self.return_to_pool());
+            if std::thread::panicking()
+                || returning
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            {
+                crate::rt::spawn(returning);
+            }
         }
     }
 }
@@ -311,7 +329,17 @@ impl<DB: Database> Floating<DB, Live<DB>> {
         // returned to the pool; also of course, if it was dropped due to an error
         // this is simply a band-aid as SQLx-next connections should be able
         // to recover from cancellations
-        if let Err(error) = self.raw.ping().await {
+        // granite patch: a driver whose `flush` finishes its pending work
+        // and fails on a connection it cannot trust (MySQL) is tested with
+        // `flush` instead: nothing to do, no round trip, on a connection whose
+        // last command was read to the end; a queued `ROLLBACK` is still sent
+        // at once and unread rows are still read.
+        let test = if self.raw.release_test_is_flush() {
+            self.raw.flush().await
+        } else {
+            self.raw.ping().await
+        };
+        if let Err(error) = test {
             tracing::warn!(
                 %error,
                 "error occurred while testing the connection on-release",
